@@ -9,8 +9,11 @@ const SECRET = process.env.JWT_SECRET;
 
 function auth(req, res, next) {
   const token = req.cookies && req.cookies.token;
-  if (!token) return res.status(401).send("Not logged in");
-  jwt.verify(token, SECRET, (err, decoded) => {
+  const authorization = req.headers.authorization || "";
+  const bearerToken = authorization.startsWith("Bearer ") ? authorization.slice(7) : null;
+  const sessionToken = bearerToken || token;
+  if (!sessionToken) return res.status(401).send("Not logged in");
+  jwt.verify(sessionToken, SECRET, (err, decoded) => {
     if (err) return res.status(401).send("Invalid token");
     req.user = decoded;
     next();
@@ -70,7 +73,7 @@ router.post("/login", async (req, res) => {
 
     const token = jwt.sign({ id: user._id, role: user.role }, SECRET, { expiresIn: "1h" });
     res.cookie("token", token, { httpOnly: true, maxAge: 60 * 60 * 1000 });
-    res.send("Login successful");
+    res.json({ token, user: { id: user._id, name: user.name, email: user.email, role: user.role } });
   } catch (err) {
     console.error(err);
     res.status(500).send("Login failed");

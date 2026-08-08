@@ -10,16 +10,27 @@ let jwt = require("jsonwebtoken");
 let { ObjectId } = require("mongodb");
 let { connectDB, getUserCollec } = require("./config/db");
 let { transformGoogleBooks } = require("./utils/bookApi");
+let libraryStore = require("./config/libraryStore");
 
 let SECRET = process.env.JWT_SECRET; // was missing entirely before — this line fixes bug #1
 
 let app = express();
 app.use(express.json());
 app.use(cookieParser());
-app.use(cors({ origin: "http://localhost:5173", credentials: true }));
+app.use(cors({
+  origin: [
+    "http://localhost:5173",
+    "http://localhost:5174",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:5174",
+  ],
+  credentials: true,
+}));
 
 function auth(req, res, next) {
   let token = req.cookies.token;
+  const authorization = req.headers.authorization || "";
+  if (authorization.startsWith("Bearer ")) token = authorization.slice(7);
 
   if (!token) {
     return res.status(401).send("Not logged in");
@@ -111,7 +122,7 @@ app.post("/login", async (req, res) => {
     let token = jwt.sign({ id: obj._id, role: obj.role }, SECRET, { expiresIn: "1h" });
     res.cookie("token", token, { httpOnly: true, maxAge: 60 * 60 * 1000 });
 
-    res.send("Login Successful");
+    res.json({ token, user: { id: obj._id, name: obj.name, email: obj.email, role: obj.role } });
   } catch (err) {
     console.error(err);
     res.status(500).send("Something went wrong during login");
@@ -123,23 +134,94 @@ app.post("/logout", (req, res) => {
   res.send("Logged out");
 });
 
-app.get("/books", async (req, res) => {
-  const query = (req.query.q || "fiction").trim();
-  const apiKey = process.env.GOOGLE_BOOKS_API_KEY;
-
-  if (!apiKey) {
-    return res.status(500).json({ error: "Google Books API key is not configured." });
-  }
-
+app.get("/library/state", async (req, res) => {
   try {
-    const response = await fetch(`https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(query)}&maxResults=12&key=${apiKey}`);
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(errorText || "Failed to fetch books");
+    if (libraryStore.getState().books.length === 0) {
+      await loadBooksIntoStore("library");
     }
+    res.json(libraryStore.getState());
+  } catch (err) {
+    console.error("LIBRARY STATE ERROR:", err);
+    res.status(502).json({ error: "Unable to load the shared library state." });
+  }
+});
 
-    const payload = await response.json();
-    const books = transformGoogleBooks(payload);
+app.post("/library/holds", auth, (req, res) => {
+  const hold = req.body;
+  if (!hold?.id || !hold.bookId || !hold.userId) {
+    return res.status(400).json({ error: "Invalid borrow request." });
+  }
+  const state = libraryStore.getState();
+  const book = state.books.find((item) => item.id === hold.bookId);
+  if (!book) return res.status(404).json({ error: "Book not found." });
+  if (state.holds.some((item) => item.bookId === hold.bookId && item.userId === hold.userId)) {
+    return res.status(409).json({ error: "You already have a request for this book." });
+  }
+  libraryStore.addHold({ ...hold, reserved: book.available > 0 });
+  res.json(libraryStore.getState());
+});
+
+app.delete("/library/holds/:id", auth, (req, res) => {
+  const hold = libraryStore.removeHold(req.params.id);
+  if (!hold) return res.status(404).json({ error: "Request not found." });
+  libraryStore.restoreHoldCopy(hold);
+  res.json(libraryStore.getState());
+});
+
+app.post("/library/holds/:id/approve", auth, (req, res) => {
+  const record = libraryStore.approveHold(req.params.id);
+  if (!record) return res.status(404).json({ error: "Request not found." });
+  res.json(libraryStore.getState());
+});
+
+app.post("/library/holds/:id/reject", auth, (req, res) => {
+  const hold = libraryStore.removeHold(req.params.id);
+  if (!hold) return res.status(404).json({ error: "Request not found." });
+  libraryStore.restoreHoldCopy(hold);
+  res.json(libraryStore.getState());
+});
+
+app.post("/library/records/:id/return", auth, (req, res) => {
+  const returned = libraryStore.returnRecord(req.params.id, req.body.bookId);
+  if (!returned) return res.status(404).json({ error: "Loan not found." });
+  res.json(libraryStore.getState());
+});
+
+app.patch("/library/books/:id/availability", auth, (req, res) => {
+  libraryStore.updateBookAvailability(req.params.id, Number(req.body.delta) || 0);
+  res.json(libraryStore.getState());
+});
+
+app.delete("/library/books/:id", auth, (req, res) => {
+  libraryStore.removeBook(req.params.id);
+  res.json(libraryStore.getState());
+});
+
+app.post("/library/books", auth, (req, res) => {
+  const book = req.body;
+  if (!book?.id || !book.title || !book.author) {
+    return res.status(400).json({ error: "Title and author are required." });
+  }
+  libraryStore.addBook(book);
+  res.json(libraryStore.getState());
+});
+
+async function loadBooksIntoStore(query) {
+  const apiKey = process.env.GOOGLE_BOOKS_API_KEY;
+  if (!apiKey) throw new Error("Google Books API key is not configured.");
+  const response = await fetch(`https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(query)}&maxResults=12&key=${apiKey}`);
+  if (!response.ok) throw new Error("Google Books request failed");
+  const books = transformGoogleBooks(await response.json());
+  libraryStore.setBooks(books);
+  return books;
+}
+
+app.get("/books", async (req, res) => {
+  try {
+    const query = (req.query.q || "fiction").trim();
+    const books = libraryStore.getState().books.length > 0
+      ? libraryStore.getState().books
+      : await loadBooksIntoStore(query);
     res.json(books);
   } catch (err) {
     console.error("BOOKS API ERROR:", err);
