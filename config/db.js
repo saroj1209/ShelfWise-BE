@@ -21,4 +21,9 @@ function getUserCollec() {
   return db.collection("users");
 }
 
-module.exports = { connectDB, getUserCollec };
+function getBorrowHistoryCollec() {
+  if (!db) throw new Error("MongoDB is not connected");
+  return db.collection("borrowHistory");
+}
+
+module.exports = { connectDB, getUserCollec, getBorrowHistoryCollec };

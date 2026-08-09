@@ -1,3 +1,5 @@
+const { getBorrowHistoryCollec } = require("./db");
+
 const state = {
   books: [],
   holds: [],
@@ -44,9 +46,10 @@ function restoreHoldCopy(hold) {
   );
 }
 
-function approveHold(holdId) {
+async function approveHold(holdId) {
   const hold = removeHold(holdId);
   if (!hold) return null;
+
 
   const borrowed = new Date();
   const due = new Date(borrowed);
@@ -71,10 +74,26 @@ function approveHold(holdId) {
       records: [record],
     });
   }
+   try {
+    await getBorrowHistoryCollec().insertOne({
+      recordId: record.id,
+      userId: hold.userId,
+      userName: hold.userName,
+      userEmail: hold.userEmail,
+      bookId: hold.bookId,
+      bookTitle: hold.bookTitle,
+      borrowedAt: borrowed,
+      dueDate: due,
+      returnedAt: null,
+      status: "borrowed",
+    });
+  } catch (err) {
+    console.error("Failed to persist borrow record:", err);
+  }
   return record;
 }
 
-function returnRecord(recordId, bookId) {
+async function returnRecord(recordId, bookId) {
   let returned = false;
   state.borrowers = state.borrowers.map((borrower) => ({
     ...borrower,
@@ -92,8 +111,37 @@ function returnRecord(recordId, bookId) {
         : book
     );
   }
+
+  // NEW — persist the return
+  if (returned) {
+    try {
+      await getBorrowHistoryCollec().updateOne(
+        { recordId },
+        { $set: { returnedAt: new Date(), status: "returned" } }
+      );
+    } catch (err) {
+      console.error("Failed to persist return:", err);
+    }
+  }
+
   return returned;
 }
+
+async function getUserHistory(userId) {
+  return getBorrowHistoryCollec()
+    .find({ userId })
+    .sort({ borrowedAt: -1 })
+    .toArray();
+}
+
+// NEW — everyone's history, for admin
+async function getAllHistory() {
+  return getBorrowHistoryCollec()
+    .find({})
+    .sort({ borrowedAt: -1 })
+    .toArray();
+}
+
 
 function updateBookAvailability(bookId, delta) {
   state.books = state.books.map((book) =>
@@ -122,4 +170,6 @@ module.exports = {
   updateBookAvailability,
   removeBook,
   addBook,
+  getUserHistory,   // NEW
+  getAllHistory,
 };

@@ -168,8 +168,8 @@ app.delete("/library/holds/:id", auth, (req, res) => {
   res.json(libraryStore.getState());
 });
 
-app.post("/library/holds/:id/approve", auth, (req, res) => {
-  const record = libraryStore.approveHold(req.params.id);
+app.post("/library/holds/:id/approve", auth, async (req, res) => {
+  const record = await libraryStore.approveHold(req.params.id);
   if (!record) return res.status(404).json({ error: "Request not found." });
   res.json(libraryStore.getState());
 });
@@ -181,11 +181,13 @@ app.post("/library/holds/:id/reject", auth, (req, res) => {
   res.json(libraryStore.getState());
 });
 
-app.post("/library/records/:id/return", auth, (req, res) => {
-  const returned = libraryStore.returnRecord(req.params.id, req.body.bookId);
+app.post("/library/records/:id/return", auth, async (req, res) => {
+  const returned = await libraryStore.returnRecord(req.params.id, req.body.bookId);
   if (!returned) return res.status(404).json({ error: "Loan not found." });
   res.json(libraryStore.getState());
 });
+
+
 
 app.patch("/library/books/:id/availability", auth, (req, res) => {
   libraryStore.updateBookAvailability(req.params.id, Number(req.body.delta) || 0);
@@ -226,6 +228,30 @@ app.get("/books", async (req, res) => {
   } catch (err) {
     console.error("BOOKS API ERROR:", err);
     res.status(502).json({ error: "Unable to load books from Google Books right now." });
+  }
+});
+
+app.get("/library/history", auth, async (req, res) => {
+  try {
+    const history = await libraryStore.getUserHistory(req.user.id);
+    res.json(history);
+  } catch (err) {
+    console.error("USER HISTORY ERROR:", err);
+    res.status(500).json({ error: "Unable to load borrow history." });
+  }
+});
+
+// NEW — admin/librarian: everyone's borrow history
+app.get("/library/history/all", auth, async (req, res) => {
+  if (req.user.role !== "librarian") {
+    return res.status(403).json({ error: "Librarian access required." });
+  }
+  try {
+    const history = await libraryStore.getAllHistory();
+    res.json(history);
+  } catch (err) {
+    console.error("ADMIN HISTORY ERROR:", err);
+    res.status(500).json({ error: "Unable to load borrow history." });
   }
 });
 
