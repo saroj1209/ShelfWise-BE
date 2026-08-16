@@ -8,9 +8,11 @@ let bcrypt = require("bcryptjs");
 let jwt = require("jsonwebtoken");
 
 let { ObjectId } = require("mongodb");
-let { connectDB, getUserCollec } = require("./config/db");
+let { connectDB, getUserCollec, getBorrowHistoryCollec } = require("./config/db");
 let { transformGoogleBooks } = require("./utils/bookApi");
 let libraryStore = require("./config/libraryStore");
+const http = require("http");
+const { initSocket, broadcastState } = require("./config/socket");
 
 let SECRET = process.env.JWT_SECRET; // was missing entirely before — this line fixes bug #1
 
@@ -158,6 +160,7 @@ app.post("/library/holds", auth, (req, res) => {
     return res.status(409).json({ error: "You already have a request for this book." });
   }
   libraryStore.addHold({ ...hold, reserved: book.available > 0 });
+  broadcastState(libraryStore.getState());
   res.json(libraryStore.getState());
 });
 
@@ -165,12 +168,14 @@ app.delete("/library/holds/:id", auth, (req, res) => {
   const hold = libraryStore.removeHold(req.params.id);
   if (!hold) return res.status(404).json({ error: "Request not found." });
   libraryStore.restoreHoldCopy(hold);
+  broadcastState(libraryStore.getState());
   res.json(libraryStore.getState());
 });
 
 app.post("/library/holds/:id/approve", auth, async (req, res) => {
   const record = await libraryStore.approveHold(req.params.id);
   if (!record) return res.status(404).json({ error: "Request not found." });
+  broadcastState(libraryStore.getState());
   res.json(libraryStore.getState());
 });
 
@@ -178,12 +183,14 @@ app.post("/library/holds/:id/reject", auth, (req, res) => {
   const hold = libraryStore.removeHold(req.params.id);
   if (!hold) return res.status(404).json({ error: "Request not found." });
   libraryStore.restoreHoldCopy(hold);
+  broadcastState(libraryStore.getState());
   res.json(libraryStore.getState());
 });
 
 app.post("/library/records/:id/return", auth, async (req, res) => {
   const returned = await libraryStore.returnRecord(req.params.id, req.body.bookId);
   if (!returned) return res.status(404).json({ error: "Loan not found." });
+  broadcastState(libraryStore.getState());
   res.json(libraryStore.getState());
 });
 
@@ -191,11 +198,13 @@ app.post("/library/records/:id/return", auth, async (req, res) => {
 
 app.patch("/library/books/:id/availability", auth, (req, res) => {
   libraryStore.updateBookAvailability(req.params.id, Number(req.body.delta) || 0);
+  broadcastState(libraryStore.getState());
   res.json(libraryStore.getState());
 });
 
 app.delete("/library/books/:id", auth, (req, res) => {
   libraryStore.removeBook(req.params.id);
+  broadcastState(libraryStore.getState());
   res.json(libraryStore.getState());
 });
 
@@ -205,17 +214,54 @@ app.post("/library/books", auth, (req, res) => {
     return res.status(400).json({ error: "Title and author are required." });
   }
   libraryStore.addBook(book);
+  broadcastState(libraryStore.getState());
   res.json(libraryStore.getState());
 });
 
 async function loadBooksIntoStore(query) {
-  const apiKey = process.env.GOOGLE_BOOKS_API_KEY;
-  if (!apiKey) throw new Error("Google Books API key is not configured.");
-  const response = await fetch(`https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(query)}&maxResults=12&key=${apiKey}`);
-  if (!response.ok) throw new Error("Google Books request failed");
-  const books = transformGoogleBooks(await response.json());
-  libraryStore.setBooks(books);
-  return books;
+  const fallbackBooks = [
+    { id: "fb-1", title: "The Great Gatsby", author: "F. Scott Fitzgerald", genre: "Fiction", total: 3, available: 3, isbn: "9780743273565" },
+    { id: "fb-2", title: "1984", author: "George Orwell", genre: "Fiction", total: 5, available: 5, isbn: "9780451524935" },
+    { id: "fb-3", title: "To Kill a Mockingbird", author: "Harper Lee", genre: "Fiction", total: 2, available: 2, isbn: "9780060935467" },
+    { id: "fb-4", title: "The Hobbit", author: "J.R.R. Tolkien", genre: "Fantasy", total: 4, available: 4, isbn: "9780547928227" }
+  ];
+
+  let booksToLoad = [];
+
+  try {
+    const apiKey = process.env.GOOGLE_BOOKS_API_KEY;
+    if (!apiKey) throw new Error("Google Books API key is not configured.");
+    
+    const response = await fetch(`https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(query)}&maxResults=12&key=${apiKey}`);
+    if (!response.ok) throw new Error("Google Books request failed with status: " + response.status);
+    
+    const books = transformGoogleBooks(await response.json());
+    if (!books || books.length === 0) throw new Error("No books found");
+    
+    booksToLoad = books;
+  } catch (err) {
+    console.warn("Falling back to local books due to error:", err.message);
+    booksToLoad = JSON.parse(JSON.stringify(fallbackBooks));
+  }
+
+  try {
+    const activeLoans = await getBorrowHistoryCollec().find({ status: "borrowed", returnedAt: null }).toArray();
+    const loanCounts = {};
+    activeLoans.forEach(loan => {
+      loanCounts[loan.bookId] = (loanCounts[loan.bookId] || 0) + 1;
+    });
+
+    booksToLoad.forEach(book => {
+      if (loanCounts[book.id]) {
+        book.available = Math.max(0, book.total - loanCounts[book.id]);
+      }
+    });
+  } catch (err) {
+    console.error("Failed to sync book availability with DB:", err);
+  }
+
+  libraryStore.setBooks(booksToLoad);
+  return booksToLoad;
 }
 
 app.get("/books", async (req, res) => {
@@ -265,5 +311,7 @@ app.use("/users", usersRouter);
 // resolved, getUserCollec() would still return undefined.
 connectDB().then(async () => {
   await ensureDefaultAdmin();
-  app.listen(PORT, () => console.log(`Server running on ${PORT}`));
+  const server = http.createServer(app);
+  initSocket(server);
+  server.listen(PORT, () => console.log(`Server running on ${PORT}`));
 });
