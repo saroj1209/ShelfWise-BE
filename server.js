@@ -12,7 +12,7 @@ let { connectDB, getUserCollec, getBorrowHistoryCollec } = require("./config/db"
 let { transformGoogleBooks } = require("./utils/bookApi");
 let libraryStore = require("./config/libraryStore");
 const http = require("http");
-const { initSocket, broadcastState } = require("./config/socket");
+const { initSocket, broadcastState, broadcastHistoryUpdate } = require("./config/socket");
 
 let SECRET = process.env.JWT_SECRET; // was missing entirely before — this line fixes bug #1
 
@@ -188,10 +188,16 @@ app.post("/library/holds/:id/reject", auth, (req, res) => {
 });
 
 app.post("/library/records/:id/return", auth, async (req, res) => {
-  const returned = await libraryStore.returnRecord(req.params.id, req.body.bookId);
-  if (!returned) return res.status(404).json({ error: "Loan not found." });
-  broadcastState(libraryStore.getState());
-  res.json(libraryStore.getState());
+  try {
+    const returned = await libraryStore.returnRecord(req.params.id);
+    if (!returned) return res.status(404).json({ error: "Loan not found or already returned." });
+    broadcastState(libraryStore.getState());
+    broadcastHistoryUpdate();
+    res.json(libraryStore.getState());
+  } catch (err) {
+    console.error("RETURN RECORD ERROR:", err);
+    res.status(500).json({ error: "Unable to return loan." });
+  }
 });
 
 
@@ -301,17 +307,36 @@ app.get("/library/history/all", auth, async (req, res) => {
   }
 });
 
-let PORT = process.env.PORT || 3000;
+let PORT = Number(process.env.PORT) || 3000;
 
 const usersRouter = require("./routes/users");
 app.use("/users", usersRouter);
+
+function startServer(port) {
+  const server = http.createServer(app);
+  initSocket(server);
+
+  server.on("error", (error) => {
+    if (error.code === "EADDRINUSE") {
+      console.warn(`Port ${port} is already in use. Retrying on ${port + 1}...`);
+      startServer(port + 1);
+      return;
+    }
+
+    console.error("Server failed to start:", error);
+    process.exit(1);
+  });
+
+  server.listen(port, () => {
+    process.env.PORT = String(port);
+    console.log(`Server running on ${port}`);
+  });
+}
 
 // bug #8 fix — we wait for MongoDB to actually finish connecting BEFORE
 // we start accepting requests. If a request came in before the connection
 // resolved, getUserCollec() would still return undefined.
 connectDB().then(async () => {
   await ensureDefaultAdmin();
-  const server = http.createServer(app);
-  initSocket(server);
-  server.listen(PORT, () => console.log(`Server running on ${PORT}`));
+  startServer(PORT);
 });

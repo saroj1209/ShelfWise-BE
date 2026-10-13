@@ -93,38 +93,50 @@ async function approveHold(holdId) {
   return record;
 }
 
-async function returnRecord(recordId, bookId) {
-  let returned = false;
+async function returnRecord(recordId) {
+  const borrowHistory = getBorrowHistoryCollec();
+  const activeLoanFilters = [
+    { recordId, status: "borrowed", returnedAt: null },
+    { recordId, status: "borrowed", returnedAt: "" },
+  ];
+
+  let loan = null;
+  let activeFilter = null;
+
+  for (const filter of activeLoanFilters) {
+    loan = await borrowHistory.findOne(filter);
+    if (loan) {
+      activeFilter = filter;
+      break;
+    }
+  }
+
+  if (!loan || !activeFilter) return false;
+
+  const returnedAt = new Date();
+  const result = await borrowHistory.updateOne(
+    activeFilter,
+    { $set: { returnedAt, status: "returned" } }
+  );
+  if (result.matchedCount === 0) return false;
+
+  // Update in-memory borrowers list if the record happens to be loaded
   state.borrowers = state.borrowers.map((borrower) => ({
     ...borrower,
     records: borrower.records.map((record) => {
       if (record.id !== recordId || record.returned) return record;
-      returned = true;
-      return { ...record, returned: new Date().toISOString().slice(0, 10) };
+      return { ...record, returned: returnedAt.toISOString().slice(0, 10) };
     }),
   }));
 
-  if (returned && bookId != null) {
-    state.books = state.books.map((book) =>
-      book.id === bookId
-        ? { ...book, available: Math.min(book.total, book.available + 1) }
-        : book
-    );
-  }
+  // Restore book availability using the bookId from the DB loan record
+  state.books = state.books.map((book) =>
+    book.id === loan.bookId
+      ? { ...book, available: Math.min(book.total, book.available + 1) }
+      : book
+  );
 
-  // NEW — persist the return
-  if (returned) {
-    try {
-      await getBorrowHistoryCollec().updateOne(
-        { recordId },
-        { $set: { returnedAt: new Date(), status: "returned" } }
-      );
-    } catch (err) {
-      console.error("Failed to persist return:", err);
-    }
-  }
-
-  return returned;
+  return true;
 }
 
 async function getUserHistory(userId) {

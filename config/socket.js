@@ -53,4 +53,10 @@ function broadcastState(state) {
   }
 }
 
-module.exports = { initSocket, broadcastState };
+function broadcastHistoryUpdate() {
+  if (io) {
+    io.emit("borrow_history_update");
+  }
+}
+
+module.exports = { initSocket, broadcastState, broadcastHistoryUpdate };
