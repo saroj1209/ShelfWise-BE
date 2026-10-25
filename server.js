@@ -19,15 +19,24 @@ let SECRET = process.env.JWT_SECRET; // was missing entirely before — this lin
 let app = express();
 app.use(express.json());
 app.use(cookieParser());
-app.use(cors({
-  origin: [
-    "http://localhost:5173",
-    "http://localhost:5174",
-    "http://127.0.0.1:5173",
-    "http://127.0.0.1:5174",
-  ],
-  credentials: true,
-}));
+const allowedOrigins = [
+  "https://shelfwise-f1144.web.app",
+  "https://shelfwise-f1144.firebaseapp.com", // Firebase's second default domain
+  "http://localhost:5173",                    // local dev, adjust to your ports
+  "http://localhost:5174",
+  "https://shelfwise-f1144.web.app"
+  // add your deployed admin app URL here too
+];
+
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
+      cb(new Error("Not allowed by CORS"));
+    },
+    credentials: true,
+  })
+);
 
 function auth(req, res, next) {
   let token = req.cookies.token;
