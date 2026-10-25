@@ -1,6 +1,5 @@
 require("dotenv").config(); // MUST be the very first line — everything below reads process.env
 
-//console.log(process.env.MONGO_URI);
 let express = require("express");
 let cors = require("cors");
 let cookieParser = require("cookie-parser");
@@ -14,18 +13,34 @@ let libraryStore = require("./config/libraryStore");
 const http = require("http");
 const { initSocket, broadcastState, broadcastHistoryUpdate } = require("./config/socket");
 
-let SECRET = process.env.JWT_SECRET; // was missing entirely before — this line fixes bug #1
+let SECRET = process.env.JWT_SECRET;
+
+const isProd = process.env.NODE_ENV === "production";
+
+// Cookie settings: the frontend (web.app) and backend (onrender.com) are on
+// different domains in production, so the cookie must be SameSite=None + Secure.
+// In local dev (http://localhost) that combination is rejected, so use Lax there.
+const cookieOpts = {
+  httpOnly: true,
+  secure: isProd,
+  sameSite: isProd ? "none" : "lax",
+};
 
 let app = express();
 app.use(express.json());
 app.use(cookieParser());
+
 const allowedOrigins = [
   "https://shelfwise-f1144.web.app",
   "https://shelfwise-f1144.firebaseapp.com", // Firebase's second default domain
-  "http://localhost:5173",                    // local dev, adjust to your ports
+  "http://localhost:5173",
   "http://localhost:5174",
-  "https://shelfwise-f1144.web.app"
-  // add your deployed admin app URL here too
+  // Deployed admin app URL(s) go in the EXTRA_ORIGINS env var on Render,
+  // comma-separated, no trailing slash, e.g. https://shelfwise-admin.web.app
+  ...(process.env.EXTRA_ORIGINS || "")
+    .split(",")
+    .map((o) => o.trim())
+    .filter(Boolean),
 ];
 
 app.use(
@@ -56,16 +71,34 @@ function auth(req, res, next) {
   });
 }
 
+// Use AFTER auth. Blocks anyone who isn't a librarian.
+function requireLibrarian(req, res, next) {
+  if (!req.user || req.user.role !== "librarian") {
+    return res.status(403).json({ error: "Librarian access required." });
+  }
+  next();
+}
+
+// The default librarian now comes from env vars instead of being hardcoded
+// in a public repo. Set ADMIN_EMAIL and ADMIN_PASSWORD on Render.
 async function ensureDefaultAdmin() {
+  const email = process.env.ADMIN_EMAIL;
+  const password = process.env.ADMIN_PASSWORD;
+
+  if (!email || !password) {
+    console.warn("ADMIN_EMAIL / ADMIN_PASSWORD not set — skipping default librarian creation");
+    return null;
+  }
+
   try {
     const userCollec = getUserCollec();
-    const existing = await userCollec.findOne({ email: "librarian@shelfwise.in" });
+    const existing = await userCollec.findOne({ email });
     if (existing) return existing;
 
-    const hashedPassword = await bcrypt.hash("admin123", 10);
+    const hashedPassword = await bcrypt.hash(password, 10);
     const result = await userCollec.insertOne({
       name: "Librarian",
-      email: "librarian@shelfwise.in",
+      email,
       password: hashedPassword,
       role: "librarian",
     });
@@ -78,10 +111,11 @@ async function ensureDefaultAdmin() {
   }
 }
 
+app.get("/", (req, res) => res.send("ShelfWise API running"));
+
 app.post("/signup", async (req, res) => {
   let userCollec = getUserCollec();
-  let { name, email, password, role } = req.body;
-  console.log("SIGNUP BODY:", req.body, "PATH:", req.path);
+  let { name, email, password } = req.body; // role is NOT accepted from the client
 
   if (!name || !email || !password) {
     return res.status(400).send("Name, email, and password are all required");
@@ -99,10 +133,9 @@ app.post("/signup", async (req, res) => {
       name,
       email,
       password: hashedPassword,
-      role: role === "librarian" ? "librarian" : "user",
+      role: "user", // public signup can never create a librarian
     });
 
-    console.log("INSERT RESULT:", result);
     res.status(201).json({ insertedId: result.insertedId });
   } catch (err) {
     console.error("SIGNUP ERROR:", err);
@@ -114,12 +147,12 @@ app.post("/login", async (req, res) => {
   let userCollec = getUserCollec();
   let { email, password } = req.body;
 
+  if (!email || !password) {
+    return res.status(400).send("Email and password required");
+  }
+
   try {
     let obj = await userCollec.findOne({ email });
-    if (!obj && email === "librarian@shelfwise.in" && password === "admin123") {
-      await ensureDefaultAdmin();
-      obj = await userCollec.findOne({ email });
-    }
 
     if (!obj) {
       return res.status(404).send("User not found");
@@ -131,7 +164,7 @@ app.post("/login", async (req, res) => {
     }
 
     let token = jwt.sign({ id: obj._id, role: obj.role }, SECRET, { expiresIn: "1h" });
-    res.cookie("token", token, { httpOnly: true, maxAge: 60 * 60 * 1000 });
+    res.cookie("token", token, { ...cookieOpts, maxAge: 60 * 60 * 1000 });
 
     res.json({ token, user: { id: obj._id, name: obj.name, email: obj.email, role: obj.role } });
   } catch (err) {
@@ -141,7 +174,7 @@ app.post("/login", async (req, res) => {
 });
 
 app.post("/logout", (req, res) => {
-  res.clearCookie("token");
+  res.clearCookie("token", cookieOpts); // must use the same options or it won't clear
   res.send("Logged out");
 });
 
@@ -159,21 +192,31 @@ app.get("/library/state", async (req, res) => {
 
 app.post("/library/holds", auth, (req, res) => {
   const hold = req.body;
-  if (!hold?.id || !hold.bookId || !hold.userId) {
+  if (!hold?.id || !hold.bookId) {
     return res.status(400).json({ error: "Invalid borrow request." });
   }
+  const userId = String(req.user.id); // taken from the token, not from the request body
   const state = libraryStore.getState();
   const book = state.books.find((item) => item.id === hold.bookId);
   if (!book) return res.status(404).json({ error: "Book not found." });
-  if (state.holds.some((item) => item.bookId === hold.bookId && item.userId === hold.userId)) {
+  if (state.holds.some((item) => item.bookId === hold.bookId && String(item.userId) === userId)) {
     return res.status(409).json({ error: "You already have a request for this book." });
   }
-  libraryStore.addHold({ ...hold, reserved: book.available > 0 });
+  libraryStore.addHold({ ...hold, userId, reserved: book.available > 0 });
   broadcastState(libraryStore.getState());
   res.json(libraryStore.getState());
 });
 
+// A member can cancel their own request; a librarian can cancel any.
 app.delete("/library/holds/:id", auth, (req, res) => {
+  const existing = libraryStore
+    .getState()
+    .holds.find((item) => String(item.id) === String(req.params.id));
+  if (!existing) return res.status(404).json({ error: "Request not found." });
+  if (String(existing.userId) !== String(req.user.id) && req.user.role !== "librarian") {
+    return res.status(403).json({ error: "You can only cancel your own request." });
+  }
+
   const hold = libraryStore.removeHold(req.params.id);
   if (!hold) return res.status(404).json({ error: "Request not found." });
   libraryStore.restoreHoldCopy(hold);
@@ -181,14 +224,14 @@ app.delete("/library/holds/:id", auth, (req, res) => {
   res.json(libraryStore.getState());
 });
 
-app.post("/library/holds/:id/approve", auth, async (req, res) => {
+app.post("/library/holds/:id/approve", auth, requireLibrarian, async (req, res) => {
   const record = await libraryStore.approveHold(req.params.id);
   if (!record) return res.status(404).json({ error: "Request not found." });
   broadcastState(libraryStore.getState());
   res.json(libraryStore.getState());
 });
 
-app.post("/library/holds/:id/reject", auth, (req, res) => {
+app.post("/library/holds/:id/reject", auth, requireLibrarian, (req, res) => {
   const hold = libraryStore.removeHold(req.params.id);
   if (!hold) return res.status(404).json({ error: "Request not found." });
   libraryStore.restoreHoldCopy(hold);
@@ -209,21 +252,19 @@ app.post("/library/records/:id/return", auth, async (req, res) => {
   }
 });
 
-
-
-app.patch("/library/books/:id/availability", auth, (req, res) => {
+app.patch("/library/books/:id/availability", auth, requireLibrarian, (req, res) => {
   libraryStore.updateBookAvailability(req.params.id, Number(req.body.delta) || 0);
   broadcastState(libraryStore.getState());
   res.json(libraryStore.getState());
 });
 
-app.delete("/library/books/:id", auth, (req, res) => {
+app.delete("/library/books/:id", auth, requireLibrarian, (req, res) => {
   libraryStore.removeBook(req.params.id);
   broadcastState(libraryStore.getState());
   res.json(libraryStore.getState());
 });
 
-app.post("/library/books", auth, (req, res) => {
+app.post("/library/books", auth, requireLibrarian, (req, res) => {
   const book = req.body;
   if (!book?.id || !book.title || !book.author) {
     return res.status(400).json({ error: "Title and author are required." });
@@ -246,13 +287,13 @@ async function loadBooksIntoStore(query) {
   try {
     const apiKey = process.env.GOOGLE_BOOKS_API_KEY;
     if (!apiKey) throw new Error("Google Books API key is not configured.");
-    
+
     const response = await fetch(`https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(query)}&maxResults=12&key=${apiKey}`);
     if (!response.ok) throw new Error("Google Books request failed with status: " + response.status);
-    
+
     const books = transformGoogleBooks(await response.json());
     if (!books || books.length === 0) throw new Error("No books found");
-    
+
     booksToLoad = books;
   } catch (err) {
     console.warn("Falling back to local books due to error:", err.message);
@@ -302,11 +343,8 @@ app.get("/library/history", auth, async (req, res) => {
   }
 });
 
-// NEW — admin/librarian: everyone's borrow history
-app.get("/library/history/all", auth, async (req, res) => {
-  if (req.user.role !== "librarian") {
-    return res.status(403).json({ error: "Librarian access required." });
-  }
+// admin/librarian: everyone's borrow history
+app.get("/library/history/all", auth, requireLibrarian, async (req, res) => {
   try {
     const history = await libraryStore.getAllHistory();
     res.json(history);
@@ -326,7 +364,9 @@ function startServer(port) {
   initSocket(server);
 
   server.on("error", (error) => {
-    if (error.code === "EADDRINUSE") {
+    // Locally it's handy to fall back to the next port. In production the app
+    // must bind to the PORT the host gives it, so fail loudly instead.
+    if (error.code === "EADDRINUSE" && !isProd) {
       console.warn(`Port ${port} is already in use. Retrying on ${port + 1}...`);
       startServer(port + 1);
       return;
@@ -342,9 +382,8 @@ function startServer(port) {
   });
 }
 
-// bug #8 fix — we wait for MongoDB to actually finish connecting BEFORE
-// we start accepting requests. If a request came in before the connection
-// resolved, getUserCollec() would still return undefined.
+// Wait for MongoDB to finish connecting BEFORE accepting requests, otherwise
+// getUserCollec() would still return undefined.
 connectDB().then(async () => {
   await ensureDefaultAdmin();
   startServer(PORT);
